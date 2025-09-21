@@ -1,0 +1,8 @@
+prometheus:
+  prometheusSpec:
+    podMonitorSelectorNilUsesHelmValues: false
+grafana:
+  adminUser: admin
+  adminPassword: admin123 # set in Secret in prod
+  dashboardsConfigMaps:
+    default: grafana-dashboards
