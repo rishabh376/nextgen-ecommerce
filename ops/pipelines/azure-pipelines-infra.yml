@@ -1,0 +1,43 @@
+trigger:
+  branches: { include: ["main"] }
+  paths: { include: ["infra/**", "ops/pipelines/azure-pipelines-infra.yml"] }
+
+variables:
+  project: nextgen
+  environment: prod
+  regions: '["eastus2","westus3"]'
+  frontdoor_custom_domain: "yourdomain.com"
+  tf_state_rg: "rg-tfstate"
+  tf_state_sa: "tfstateacct123"
+  tf_state_container: "tfstate"
+
+pool: { vmImage: "ubuntu-latest" }
+
+stages:
+- stage: Terraform
+  jobs:
+  - job: apply
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      displayName: "Terraform Init/Apply"
+      inputs:
+        azureSubscription: "azure-sp"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          cd infra/terraform
+          echo 'regions = ${regions}' > auto.tfvars
+          cat > terraform.tfvars <<EOF
+          project = "$(project)"
+          environment = "$(environment)"
+          regions = $(regions)
+          frontdoor_custom_domain = "$(frontdoor_custom_domain)"
+          tf_state_rg = "$(tf_state_rg)"
+          tf_state_sa = "$(tf_state_sa)"
+          tf_state_container = "$(tf_state_container)"
+          aad_tenant_id = "$(AZURE_TENANT_ID)"
+          EOF
+          terraform init -upgrade
+          terraform apply -auto-approve
