@@ -1,0 +1,83 @@
+trigger:
+  branches: { include: ["main"] }
+  paths: { include: ["apps/**", "ops/k8s/**", "ops/pipelines/azure-pipelines-apps.yml"] }
+
+variables:
+  acrName: "youracrname" # output from TF
+  aksResourceGroup: "rg-nextgen-prod-eastus2" # one region pipeline run; repeat for westus3 or add multi-region stage
+  aksCluster: "nextgen-prod-eastus2"
+  imageTag: "$(Build.SourceVersion)"
+
+pool: { vmImage: "ubuntu-latest" }
+
+stages:
+- stage: BuildPush
+  jobs:
+  - job: docker
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: "azure-sp"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          az acr login -n $(acrName)
+          ACR_LOGIN=$(az acr show -n $(acrName) --query loginServer -o tsv)
+
+          build_push () {
+            local name=$1 path=$2
+            docker build -t $ACR_LOGIN/$name:$(imageTag) $path
+            docker push $ACR_LOGIN/$name:$(imageTag)
+          }
+
+          build_push cart-service apps/services/cart-service
+          build_push inventory-service apps/services/inventory-service
+          build_push orders-service apps/services/orders-service
+          build_push payments-service apps/services/payments-service
+          build_push recommendation-service apps/services/recommendation-service
+          build_push forecasting-service apps/services/forecasting-service
+          build_push gateway apps/services/gateway
+          build_push frontend apps/frontend
+
+          echo "ACR_LOGIN=$ACR_LOGIN" >> $(Build.SourcesDirectory)/.acr.env
+
+- stage: Deploy
+  dependsOn: BuildPush
+  jobs:
+  - job: apply
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: "azure-sp"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          source .acr.env
+          az aks get-credentials -g $(aksResourceGroup) -n $(aksCluster) --overwrite-existing
+
+          kubectl apply -f ops/k8s/namespaces.yaml
+          # Install NGINX if not present
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace
+
+          # Sync SecretProviderClass (Key Vault)
+          sed "s|<your-kv-name>|$(kvName)|g" ops/k8s/secrets-store-csi.yaml | kubectl apply -f -
+
+          # Replace image placeholders and apply deployments
+          for svc in cart-service inventory-service orders-service payments-service recommendation-service gateway frontend; do
+            yq -i ".spec.template.spec.containers[0].image = \"$ACR_LOGIN/$svc:$(imageTag)\"" ops/k8s/services/$svc/deployment.yaml
+            kubectl apply -f ops/k8s/services/$svc/deployment.yaml
+            kubectl apply -f ops/k8s/services/$svc/service.yaml
+          done
+
+          # CronJob
+          yq -i ".spec.jobTemplate.spec.template.spec.containers[0].image = \"$ACR_LOGIN/forecasting-service:$(imageTag)\"" ops/k8s/services/forecasting-cronjob/cronjob.yaml
+          kubectl apply -f ops/k8s/services/forecasting-cronjob/cronjob.yaml
+
+          # Ingress
+          kubectl apply -f ops/k8s/services/gateway/ingress.yaml
+          kubectl apply -f ops/k8s/services/frontend/ingress.yaml
