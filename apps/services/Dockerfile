@@ -1,20 +1,17 @@
+# Build Next.js
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
-
-FROM node:20-alpine AS build
-WORKDIR /app
-COPY --from=deps /app/node_modules node_modules
-COPY tsconfig.json ./
-COPY src src
+COPY . .
 RUN npm run build
 
+# Runtime image
 FROM node:20-alpine
 WORKDIR /app
 ENV NODE_ENV=production
-COPY --from=build /app/dist dist
-COPY package*.json ./
-COPY --from=deps /app/node_modules node_modules
-EXPOSE 8080
-CMD ["node", "dist/server.js"]
+COPY --from=deps /app/.next .next
+COPY --from=deps /app/package*.json ./
+RUN npm ci --omit=dev
+EXPOSE 3000
+CMD ["npm","start"]
