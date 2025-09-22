@@ -1,3 +1,4 @@
+# Create app namespace with restricted Pod Security
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -5,11 +6,8 @@ metadata:
   labels:
     pod-security.kubernetes.io/enforce: restricted
 ---
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+# Monitoring namespace for Prometheus/Grafana (Helm handles most resources)
+apiVersion: v1
+kind: Namespace
 metadata:
-  name: default-deny
-  namespace: ecom
-spec:
-  podSelector: {}
-  policyTypes: ["Ingress", "Egress"]
+  name: monitoring

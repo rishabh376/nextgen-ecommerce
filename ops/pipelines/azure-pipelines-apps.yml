@@ -1,22 +1,37 @@
+# Apps pipeline:
+# - Builds and pushes all images to ACR
+# - Installs cluster add-ons (NGINX, CSI, Prometheus/Grafana, KEDA)
+# - Deploys services to each region (matrix)
+# - Collects ingress IPs per region and runs Terraform again to create/update Front Door
 trigger:
   branches: { include: ["main"] }
-  paths: { include: ["apps/**", "ops/k8s/**", "ops/pipelines/azure-pipelines-apps.yml"] }
+  paths:    { include: ["apps/**", "ops/k8s/**", "ops/pipelines/azure-pipelines-apps.yml"] }
 
 variables:
-  acrName: "youracrname" # output from TF
-  aksResourceGroup: "rg-nextgen-prod-eastus2" # one region pipeline run; repeat for westus3 or add multi-region stage
-  aksCluster: "nextgen-prod-eastus2"
+  # Fill these from Terraform outputs or set manually
+  acrName: ""                            # e.g. output from TF: module.acr.name
+  kvName: ""                             # Key Vault name to reference in SecretProviderClass
+  regions: '["eastus2","westus3"]'
+  # TF backend (same as infra pipeline)
+  tf_state_rg: "rg-tfstate"
+  tf_state_sa: "tfstateacct123"
+  tf_state_container: "tfstate"
+  tf_state_key: "ecom/terraform.tfstate"
+
   imageTag: "$(Build.SourceVersion)"
 
 pool: { vmImage: "ubuntu-latest" }
 
 stages:
 - stage: BuildPush
+  displayName: "Build & Push Docker Images"
   jobs:
   - job: docker
     steps:
     - checkout: self
+
     - task: AzureCLI@2
+      displayName: "Login to ACR and build/push"
       inputs:
         azureSubscription: "azure-sp"
         scriptType: bash
@@ -25,31 +40,45 @@ stages:
           set -e
           az acr login -n $(acrName)
           ACR_LOGIN=$(az acr show -n $(acrName) --query loginServer -o tsv)
+          echo "ACR_LOGIN=$ACR_LOGIN" >> $(Build.SourcesDirectory)/.acr.env
 
           build_push () {
             local name=$1 path=$2
+            echo "Building $name..."
             docker build -t $ACR_LOGIN/$name:$(imageTag) $path
             docker push $ACR_LOGIN/$name:$(imageTag)
           }
 
+          # Node services
           build_push cart-service apps/services/cart-service
           build_push inventory-service apps/services/inventory-service
           build_push orders-service apps/services/orders-service
           build_push payments-service apps/services/payments-service
+          build_push gateway apps/services/gateway
+
+          # Python services
           build_push recommendation-service apps/services/recommendation-service
           build_push forecasting-service apps/services/forecasting-service
-          build_push gateway apps/services/gateway
+
+          # Frontend
           build_push frontend apps/frontend
 
-          echo "ACR_LOGIN=$ACR_LOGIN" >> $(Build.SourcesDirectory)/.acr.env
-
-- stage: Deploy
+- stage: DeployPerRegion
+  displayName: "Deploy to AKS (per region)"
   dependsOn: BuildPush
   jobs:
-  - job: apply
+  - job: Deploy
+    timeoutInMinutes: 60
+    strategy:
+      matrix:
+        # Expand for each region listed
+        # Pipeline expression to parse JSON into matrix is complex; simplest: hardcode or maintain variable groups.
+        eastus2: { region: "eastus2" }
+        westus3: { region: "westus3" }
     steps:
     - checkout: self
     - task: AzureCLI@2
+      displayName: "Setup tools and kubectl credentials"
       inputs:
         azureSubscription: "azure-sp"
         scriptType: bash
@@ -57,27 +86,147 @@ stages:
         inlineScript: |
           set -e
           source .acr.env
-          az aks get-credentials -g $(aksResourceGroup) -n $(aksCluster) --overwrite-existing
+          # install yq for YAML edits
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          # set AKS vars for this region
+          AKS_RG="rg-$(project)-$(environment)-$(region)"
+          AKS_NAME="$(project)-$(environment)-$(region)"
+          echo "Using AKS $AKS_NAME in $AKS_RG"
+          az aks get-credentials -g $AKS_RG -n $AKS_NAME --overwrite-existing
 
+          # Create namespaces and baseline policies
           kubectl apply -f ops/k8s/namespaces.yaml
-          # Install NGINX if not present
-          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
-          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace
 
-          # Sync SecretProviderClass (Key Vault)
+          # Install Secrets Store CSI + Azure provider (once per cluster, idempotent)
+          helm repo add csi-secrets-store https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts
+          helm repo update
+          helm upgrade --install csi-secrets-store csi-secrets-store/secrets-store-csi-driver -n kube-system
+          helm repo add secrets-store-csi-driver https://azure.github.io/secrets-store-csi-driver-provider-azure/charts
+          helm upgrade --install csi-azure secrets-store-csi-driver/csi-azure -n kube-system
+
+          # Install Kube Prometheus Stack (Prometheus + Grafana)
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+            -n monitoring --create-namespace \
+            -f ops/k8s/prometheus-grafana-values.yaml
+
+          # Install KEDA for event-driven autoscaling
+          helm repo add kedacore https://kedacore.github.io/charts
+          helm upgrade --install keda kedacore/keda --namespace keda --create-namespace
+
+          # Install NGINX Ingress Controller
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace ingress-nginx --create-namespace
+
+          # SecretProviderClass (Key Vault -> K8s Secret sync)
           sed "s|<your-kv-name>|$(kvName)|g" ops/k8s/secrets-store-csi.yaml | kubectl apply -f -
 
-          # Replace image placeholders and apply deployments
+          # Apply ServiceAccount + RBAC
+          kubectl apply -f ops/k8s/rbac/ecom-rbac.yaml
+
+          # Apply NetworkPolicies (default deny + specific allows)
+          kubectl apply -f ops/k8s/networkpolicies/default-deny.yaml
+          kubectl apply -f ops/k8s/networkpolicies/allow-ingress-to-gateway-frontend.yaml
+          kubectl apply -f ops/k8s/networkpolicies/allow-gateway-to-backend.yaml
+          kubectl apply -f ops/k8s/networkpolicies/lockdown-payments.yaml
+
+          # Deploy services (set images via yq)
           for svc in cart-service inventory-service orders-service payments-service recommendation-service gateway frontend; do
             yq -i ".spec.template.spec.containers[0].image = \"$ACR_LOGIN/$svc:$(imageTag)\"" ops/k8s/services/$svc/deployment.yaml
             kubectl apply -f ops/k8s/services/$svc/deployment.yaml
             kubectl apply -f ops/k8s/services/$svc/service.yaml
+            # HPA (if exists)
+            if [ -f ops/k8s/services/$svc/hpa.yaml ]; then kubectl apply -f ops/k8s/services/$svc/hpa.yaml; fi
+            # ServiceMonitor (if exists)
+            if [ -f ops/k8s/services/$svc/servicemonitor.yaml ]; then kubectl apply -f ops/k8s/services/$svc/servicemonitor.yaml; fi
+            # PDB (optional)
+            if [ -f ops/k8s/services/$svc/pdb.yaml ]; then kubectl apply -f ops/k8s/services/$svc/pdb.yaml; fi
           done
 
-          # CronJob
+          # CronJob for forecasting
           yq -i ".spec.jobTemplate.spec.template.spec.containers[0].image = \"$ACR_LOGIN/forecasting-service:$(imageTag)\"" ops/k8s/services/forecasting-cronjob/cronjob.yaml
           kubectl apply -f ops/k8s/services/forecasting-cronjob/cronjob.yaml
 
-          # Ingress
+          # KEDA scaler for payments on Service Bus queue
+          kubectl apply -f ops/k8s/keda/payments-scaler.yaml
+
+          # Ingresses
           kubectl apply -f ops/k8s/services/gateway/ingress.yaml
           kubectl apply -f ops/k8s/services/frontend/ingress.yaml
+
+          # Seed data Job (products + inventory); run once idempotently
+          kubectl apply -f ops/k8s/tools/seed-job.yaml
+          kubectl wait --for=condition=complete job/seed-data -n ecom --timeout=180s || true
+
+          # Get NGINX public IP for this region and publish as pipeline artifact
+          IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "NGINX_IP=$IP"
+          mkdir -p $(Build.ArtifactStagingDirectory)
+          echo "$IP" > $(Build.ArtifactStagingDirectory)/ingress_ip_$(region).txt
+    - publish: $(Build.ArtifactStagingDirectory)
+      artifact: ingress-ips-$(region)
+
+- stage: FrontDoor
+  displayName: "Create/Update Front Door with Ingress IPs"
+  dependsOn: DeployPerRegion
+  jobs:
+  - job: ApplyFD
+    steps:
+    - checkout: self
+    - download: current
+      artifact: ingress-ips-eastus2
+      patterns: '**/*'
+      displayName: "Download eastus2 IP"
+      # Add more downloads for additional regions
+    - download: current
+      artifact: ingress-ips-westus3
+      patterns: '**/*'
+      displayName: "Download westus3 IP"
+
+    - task: AzureCLI@2
+      displayName: "Build map and terraform apply"
+      inputs:
+        azureSubscription: "azure-sp"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          cd infra/terraform
+
+          # Build JSON map of region->IP by reading artifacts
+          declare -A MAP
+          if [ -f "$(Pipeline.Workspace)/ingress-ips-eastus2/ingress_ip_eastus2.txt" ]; then
+            MAP["eastus2"]=$(cat "$(Pipeline.Workspace)/ingress-ips-eastus2/ingress_ip_eastus2.txt")
+          fi
+          if [ -f "$(Pipeline.Workspace)/ingress-ips-westus3/ingress_ip_westus3.txt" ]; then
+            MAP["westus3"]=$(cat "$(Pipeline.Workspace)/ingress-ips-westus3/ingress_ip_westus3.txt")
+          fi
+
+          # Create a tfvars.json file compatible with Terraform -var-file flag
+          cat > frontdoor.auto.tfvars.json <<EOF
+          {
+            "frontdoor_backends": {
+              "eastus2": "${MAP[eastus2]}",
+              "westus3": "${MAP[westus3]}"
+            }
+          }
+          EOF
+          cat frontdoor.auto.tfvars.json
+
+          # Install terraform (if missing)
+          if ! command -v terraform >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y unzip
+            curl -Lo tf.zip https://releases.hashicorp.com/terraform/1.6.6/terraform_1.6.6_linux_amd64.zip
+            unzip tf.zip && sudo mv terraform /usr/local/bin/
+          fi
+
+          terraform init \
+            -backend=true \
+            -backend-config="resource_group_name=$(tf_state_rg)" \
+            -backend-config="storage_account_name=$(tf_state_sa)" \
+            -backend-config="container_name=$(tf_state_container)" \
+            -backend-config="key=$(tf_state_key)"
+
+          terraform apply -auto-approve -var-file="frontdoor.auto.tfvars.json"
