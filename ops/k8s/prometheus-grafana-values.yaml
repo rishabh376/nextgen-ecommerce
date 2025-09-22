@@ -1,8 +1,10 @@
+# Minimal values for kube-prometheus-stack to pick up ServiceMonitors in any namespace
+grafana:
+  adminUser: admin         # override via Secret in prod
+  adminPassword: admin123  # override via Secret in prod
+  defaultDashboardsEnabled: true
+
 prometheus:
   prometheusSpec:
     podMonitorSelectorNilUsesHelmValues: false
-grafana:
-  adminUser: admin
-  adminPassword: admin123 # set in Secret in prod
-  dashboardsConfigMaps:
-    default: grafana-dashboards
+    serviceMonitorSelectorNilUsesHelmValues: false

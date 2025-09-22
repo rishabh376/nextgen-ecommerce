@@ -1,26 +1,47 @@
+# Infra pipeline:
+# 1) Applies base infrastructure (RGs, VNet, ACR, AKS, KV, Cosmos, Redis, SB, Monitor)
+# 2) Skips Front Door until Apps pipeline has NGINX public IPs
 trigger:
   branches: { include: ["main"] }
-  paths: { include: ["infra/**", "ops/pipelines/azure-pipelines-infra.yml"] }
+  paths:    { include: ["infra/**", "ops/pipelines/azure-pipelines-infra.yml"] }
 
 variables:
   project: nextgen
   environment: prod
   regions: '["eastus2","westus3"]'
-  frontdoor_custom_domain: "yourdomain.com"
   tf_state_rg: "rg-tfstate"
-  tf_state_sa: "tfstateacct123"
+  tf_state_sa: "tfstateacct123"      # must be globally unique and pre-created or created in an initial step
   tf_state_container: "tfstate"
+  tf_state_key: "ecom/terraform.tfstate"
+  stripe_secret: ""                  # optional: set in pipeline variable to push into Key Vault
 
 pool: { vmImage: "ubuntu-latest" }
 
 stages:
-- stage: Terraform
+- stage: TerraformBase
+  displayName: "Terraform: Base Infra"
   jobs:
-  - job: apply
+  - job: Apply
     steps:
     - checkout: self
+
     - task: AzureCLI@2
-      displayName: "Terraform Init/Apply"
+      displayName: "Ensure TF state container exists"
+      inputs:
+        azureSubscription: "azure-sp"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          # Create storage account/container for TF state if missing
+          az group create -n $(tf_state_rg) -l eastus
+          if ! az storage account show -g $(tf_state_rg) -n $(tf_state_sa) >/dev/null 2>&1; then
+            az storage account create -g $(tf_state_rg) -n $(tf_state_sa) -l eastus --sku Standard_LRS
+          fi
+          az storage container create --name $(tf_state_container) --account-name $(tf_state_sa) || true
+
+    - task: AzureCLI@2
+      displayName: "Terraform Init/Apply (base)"
       inputs:
         azureSubscription: "azure-sp"
         scriptType: bash
@@ -28,16 +49,38 @@ stages:
         inlineScript: |
           set -e
           cd infra/terraform
-          echo 'regions = ${regions}' > auto.tfvars
+
+          # Write terraform.tfvars for base apply (Front Door backends left empty)
           cat > terraform.tfvars <<EOF
-          project = "$(project)"
-          environment = "$(environment)"
-          regions = $(regions)
-          frontdoor_custom_domain = "$(frontdoor_custom_domain)"
-          tf_state_rg = "$(tf_state_rg)"
-          tf_state_sa = "$(tf_state_sa)"
-          tf_state_container = "$(tf_state_container)"
-          aad_tenant_id = "$(AZURE_TENANT_ID)"
+          project           = "$(project)"
+          environment       = "$(environment)"
+          regions           = $(regions)
+          aad_tenant_id     = "$(AZURE_TENANT_ID)"
+          stripe_secret     = "$(stripe_secret)"
           EOF
-          terraform init -upgrade
+
+          # Install Terraform if not present
+          if ! command -v terraform >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y unzip
+            curl -Lo tf.zip https://releases.hashicorp.com/terraform/1.6.6/terraform_1.6.6_linux_amd64.zip
+            unzip tf.zip && sudo mv terraform /usr/local/bin/
+          fi
+
+          terraform init \
+            -backend=true \
+            -backend-config="resource_group_name=$(tf_state_rg)" \
+            -backend-config="storage_account_name=$(tf_state_sa)" \
+            -backend-config="container_name=$(tf_state_container)" \
+            -backend-config="key=$(tf_state_key)"
+
           terraform apply -auto-approve
+
+    - task: AzureCLI@2
+      displayName: "Show key outputs"
+      inputs:
+        azureSubscription: "azure-sp"
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          cd infra/terraform
+          terraform output -json | jq
