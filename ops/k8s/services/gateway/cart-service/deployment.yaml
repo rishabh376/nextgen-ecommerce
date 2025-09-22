@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart-service
+  namespace: ecom
+  labels: { app: cart-service, app.kubernetes.io/part-of: ecom }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: cart-service } }
+  template:
+    metadata:
+      labels:
+        app: cart-service
+        app.kubernetes.io/part-of: ecom
+    spec:
+      serviceAccountName: ecom-sa
+      containers:
+      - name: cart-service
+        image: <ACR_LOGIN_SERVER>/cart-service:latest  # replaced by pipeline
+        ports: [{ containerPort: 8080, name: http }]
+        envFrom:
+        - secretRef: { name: app-secrets }    # KV secrets via CSI
+        env:
+        - name: COSMOS_DB
+          value: "ecom"
+        - name: CARTS_CONTAINER
+          value: "carts"
+        resources:
+          requests: { cpu: "100m", memory: "128Mi" }
+          limits:   { cpu: "500m", memory: "512Mi" }
+        readinessProbe: { httpGet: { path: /healthz, port: http }, initialDelaySeconds: 3, periodSeconds: 5 }
+        livenessProbe:  { httpGet: { path: /healthz, port: http }, initialDelaySeconds: 10, periodSeconds: 10 }
+        securityContext:
+          runAsUser: 10001
+          runAsGroup: 10001
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          seccompProfile: { type: RuntimeDefault }
+      # Mount CSI volume to sync secrets -> K8s secret (optional: inline mount not required when using secretObjects)
+      volumes:
+      - name: secrets-store
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes: { secretProviderClass: "kv-secrets" }
