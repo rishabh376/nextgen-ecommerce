@@ -1,12 +1,15 @@
+# Allow ingress-nginx to reach only frontend and gateway pods
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-nginx-to-services
+  name: allow-nginx-to-frontend-gateway
   namespace: ecom
 spec:
   podSelector:
-    matchLabels:
-      app.kubernetes.io/part-of: ecom
+    matchExpressions:
+    - key: app
+      operator: In
+      values: ["frontend","gateway"]
   ingress:
   - from:
     - namespaceSelector:

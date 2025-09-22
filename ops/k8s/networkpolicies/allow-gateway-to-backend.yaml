@@ -1,0 +1,16 @@
+# Allow gateway to call internal backend services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-backend
+  namespace: ecom
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  egress:
+  - to:
+    - podSelector: { matchLabels: { app: cart-service } }
+    - podSelector: { matchLabels: { app: inventory-service } }
+    - podSelector: { matchLabels: { app: orders-service } }
+  policyTypes: ["Egress"]

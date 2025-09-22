@@ -1,0 +1,15 @@
+# Payments service does not accept HTTP from other pods (SB is external egress).
+# We still expose Service for scraping /metrics, but ingress is blocked by default deny.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payments-lockdown
+  namespace: ecom
+spec:
+  podSelector:
+    matchLabels:
+      app: payments-service
+  ingress: []      # block all intra-cluster ingress
+  egress:
+  - {}             # allow egress (to Service Bus / Stripe)
+  policyTypes: ["Ingress","Egress"]
