@@ -1,0 +1,41 @@
+# Seeds Cosmos with products and inventory
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-data
+  namespace: ecom
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: ecom-sa
+      containers:
+      - name: seeder
+        # Simpler: use curl container + Python; here we embed a small Python script via sh -c
+        image: python:3.11-slim
+        command: ["/bin/sh","-c"]
+        args:
+        - |
+          pip install azure-cosmos==4.7.0 >/dev/null
+          python - <<'PY'
+          import os
+          from azure.cosmos import CosmosClient
+          conn = os.environ["COSMOS_CONN_STR"]
+          db_name="ecom"
+          client = CosmosClient.from_connection_string(conn)
+          db = client.get_database_client(db_name)
+          products = db.get_container_client("products")
+          inventory = db.get_container_client("inventory")
+          catalog = [
+            {"id":"milk","name":"Milk","price":2.99},
+            {"id":"eggs","name":"Eggs","price":3.49},
+            {"id":"bread","name":"Bread","price":1.99},
+            {"id":"apples","name":"Apples","price":0.99},
+            {"id":"rice","name":"Rice","price":5.49},
+          ]
+          for p in catalog:
+              products.upsert_item(p)
+              inventory.upsert_item({"id": p["id"], "productId": p["id"], "available": 500})
+          print("Seeded products/inventory")
+          PY
+        envFrom: [{ secretRef: { name: app-secrets } }]
