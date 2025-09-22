@@ -7,10 +7,13 @@ terraform {
     key                  = "ecom/terraform.tfstate"
   }
   required_providers {
-    azurerm = { source = "hashicorp/azurerm", version = "~> 3.115" }
+    azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
     random  = { source = "hashicorp/random" }
   }
 }
+data "azurerm_client_config" "current" {}
+
 provider "azurerm" {
   features {}
+  subscription_id = data.azurerm_client_config.current.subscription_id
 }
