@@ -1,0 +1,31 @@
+# Minimal SA for app pods (no cluster-wide perms required here)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ecom-sa
+  namespace: ecom
+---
+# Example: allow reading ConfigMaps in own namespace (if needed)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cm-read
+  namespace: ecom
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get","list","watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cm-read-binding
+  namespace: ecom
+subjects:
+- kind: ServiceAccount
+  name: ecom-sa
+  namespace: ecom
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cm-read
