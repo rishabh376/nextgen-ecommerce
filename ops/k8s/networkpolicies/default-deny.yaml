@@ -1,0 +1,9 @@
+# Default deny all ingress and egress within ecom namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: ecom
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress","Egress"]
