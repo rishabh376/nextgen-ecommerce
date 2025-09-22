@@ -1,0 +1,14 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cart-service
+  namespace: ecom
+spec:
+  selector:
+    matchLabels: { app: cart-service }
+  namespaceSelector:
+    matchNames: ["ecom"]
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s

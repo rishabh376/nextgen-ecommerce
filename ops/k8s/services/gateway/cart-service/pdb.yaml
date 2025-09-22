@@ -1,0 +1,9 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cart-service
+  namespace: ecom
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: cart-service }
